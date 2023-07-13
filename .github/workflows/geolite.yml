@@ -1,0 +1,100 @@
+name: Publish GeoLite mmdb
+
+on:
+  repository_dispatch:
+  workflow_dispatch:
+  schedule:
+    - cron: 0 1 * * *
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: write-all
+    outputs:
+      tag_des: ${{ steps.setoutenv.outputs.tag_des }}
+      tag_name: ${{ steps.setoutenv.outputs.tag_name }}
+      run_continue: ${{ steps.setoutenv.outputs.run_continue }}
+    steps:
+    - name: Download GeoLite.mmdb
+      run: |
+        for i in {ASN,City,Country}; do
+          wget -nv -O GeoLite2-$i.tar.gz "https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-${i}&license_key=${{ secrets.LICENSE_KEY }}&suffix=tar.gz"
+          wget -nv -O GeoLite2-$i.tar.gz.sha256 "https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-${i}&license_key=${{ secrets.LICENSE_KEY }}&suffix=tar.gz.sha256"
+        done
+        sed '/GeoLite2-/s/_.*/.tar.gz/' -i *.tar.gz.sha256
+        sha256sum -c *.tar.gz.sha256
+        for i in *.tar.gz; do tar xvf $i; done
+        VER="$(ls -d GeoLite2-Country_*)"; VER=${VER##*_}
+        echo "TAG_NAME=${VER}" >> $GITHUB_ENV
+        mkdir -p upload
+        cp GeoLite2-*_*/*.mmdb upload
+        xz -vT0 upload/*.mmdb
+
+    - name: Check version
+      run: |
+        cd upload
+        git config --global init.defaultBranch main
+        git init
+        git config user.name "${{ github.actor }}"
+        git config user.email "${{ github.actor }}@users.noreply.github.com"
+        git checkout -b release
+        ln -srv {GeoLite2-,}Country.mmdb.xz
+        git remote add origin "https://${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}"
+        wget -nv https://github.com/${{ github.repository }}/raw/release/VERSION || echo ":: No such branch: release ! "
+        if test -f VERSION; then
+          OLD_VERSION="$(<VERSION)"
+        fi
+        if ((TAG_NAME>OLD_VERSION)); then
+          GH_CONTINUE=1
+          TAG_DES="Created date: $(TZ=GMT-8 date +%Y.%m.%d\ %H:%M)"
+          echo "$TAG_NAME" > VERSION
+          git add .
+          git commit -m "Creating tag ${{ env.TAG_NAME }}"
+          echo "GH_PUSH=1" >>$GITHUB_ENV
+        elif ((TAG_NAME==OLD_VERSION)); then
+          echo "The latest version is: ${{ env.TAG_NAME }}, no update"
+        else
+          echo "??? The latest version is: ${{ env.TAG_NAME }} ???"
+        fi
+        echo "tag_des=$TAG_DES" >> $GITHUB_OUTPUT
+        echo "tag_name=${{ env.TAG_NAME }}" >> $GITHUB_OUTPUT
+        echo "run_continue=$GH_CONTINUE" >> $GITHUB_OUTPUT
+      id: setoutenv
+    - name: Push to release branch
+      if: ${{ env.GH_PUSH == 1 }}
+      run: cd upload && git push -f origin release
+
+
+  release:
+    needs: download
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: ${{ needs.download.outputs.run_continue == 1 }}
+    permissions: write-all
+    steps:
+    - name: Checkout Repository release branch
+      uses: actions/checkout@v3
+      with:
+        fetch-depth: 1
+        ref: release
+
+    - name: Set tag name
+      run: echo "TAG_NAME=${{ needs.download.outputs.tag_name }}" >>$GITHUB_ENV
+    - name: Set release description
+      run: echo "TAG_DES=${{ needs.download.outputs.tag_des }}" >>$GITHUB_ENV
+
+    - name: Upload to Releases
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: ${{ env.TAG_NAME }}
+        body: ${{ env.TAG_DES }}
+        files: ./*.mmdb.xz
+
+    - name: Remove old Releases
+      uses: dev-drprasad/delete-older-releases@v0.2.1
+      with:
+        keep_latest: 2
+        delete_tags: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
